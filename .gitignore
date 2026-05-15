@@ -1,5 +1,8 @@
 /target
 
+# Local OpenClaude/Superpowers planning artifacts.
+docs/superpowers/
+
 # Snap build artifacts
 /parts/
 /prime/
