@@ -123,12 +123,21 @@ const OUTLINE_DEFAULT_WIDTH: f32 = 208.0; // 200 + 8 margins
 const PANEL_SEPARATORS: f32 = 16.0;
 const OPTIMAL_WINDOW_HEIGHT: f32 = 750.0;
 
+fn content_default_width(full_width_content: bool) -> Option<usize> {
+    if full_width_content {
+        None
+    } else {
+        Some(CONTENT_OPTIMAL_WIDTH as usize)
+    }
+}
+
 /// Persisted state saved between sessions
 #[derive(Serialize, Deserialize, Default)]
 struct PersistedState {
     dark_mode: Option<bool>,
     zoom_level: Option<f32>,
     show_outline: Option<bool>,
+    full_width_content: Option<bool>,
     open_tabs: Option<Vec<PathBuf>>,
     active_tab: Option<usize>,
     // File explorer state
@@ -1063,6 +1072,7 @@ struct MarkdownApp {
     dark_mode: bool,
     zoom_level: f32,
     show_outline: bool,
+    full_width_content: bool,
     watch_enabled: bool,
     error_message: Option<String>,
     is_dragging: bool,
@@ -1152,6 +1162,7 @@ impl MarkdownApp {
             .unwrap_or_else(|| cc.egui_ctx.style().visuals.dark_mode);
         let zoom_level = persisted.zoom_level.unwrap_or(1.0).clamp(0.5, 3.0);
         let show_outline = persisted.show_outline.unwrap_or(true);
+        let full_width_content = persisted.full_width_content.unwrap_or(false);
         let show_explorer = persisted.show_explorer.unwrap_or(true);
 
         // Determine initial tabs
@@ -1230,6 +1241,7 @@ impl MarkdownApp {
             dark_mode,
             zoom_level,
             show_outline,
+            full_width_content,
             watch_enabled: watch,
             error_message: None,
             is_dragging: false,
@@ -2033,6 +2045,7 @@ impl MarkdownApp {
     fn render_tab_content(&mut self, ui: &mut egui::Ui, ctrl_held: bool) -> Option<PathBuf> {
         let mut open_in_new_tab: Option<PathBuf> = None;
 
+        let default_width = content_default_width(self.full_width_content);
         let tab = self.tabs.get_mut(self.active_tab)?;
 
         // Content area (no inner CentralPanel needed - we're already in one)
@@ -2069,7 +2082,7 @@ impl MarkdownApp {
                     CommonMarkViewer::new()
                         .default_implicit_uri_scheme(&tab.base_uri)
                         .max_image_width(Some(800))
-                        .default_width(Some(600))
+                        .default_width(default_width)
                         .indentation_spaces(2)
                         .show_alt_text_on_hover(true)
                         .syntax_theme_dark("base16-ocean.dark")
@@ -2756,6 +2769,7 @@ impl eframe::App for MarkdownApp {
             dark_mode: Some(self.dark_mode),
             zoom_level: Some(self.zoom_level),
             show_outline: Some(self.show_outline),
+            full_width_content: Some(self.full_width_content),
             open_tabs: Some(self.get_open_tab_paths()),
             active_tab: Some(self.active_tab),
             show_explorer: Some(self.show_explorer),
@@ -3172,6 +3186,16 @@ impl eframe::App for MarkdownApp {
                         ui.close();
                     }
 
+                    let full_width_text = if self.full_width_content {
+                        "✓ Full Width"
+                    } else {
+                        "Full Width"
+                    };
+                    if ui.add(egui::Button::new(full_width_text)).clicked() {
+                        self.full_width_content = !self.full_width_content;
+                        ui.close();
+                    }
+
                     ui.separator();
 
                     if ui
@@ -3475,3 +3499,18 @@ Visit [egui](https://github.com/emilk/egui) for more information.
 
 [^1]: This is a footnote with additional details.
 "#;
+
+#[cfg(test)]
+mod content_width_tests {
+    use super::*;
+
+    #[test]
+    fn capped_content_width_uses_optimal_width() {
+        assert_eq!(content_default_width(false), Some(600));
+    }
+
+    #[test]
+    fn full_width_content_uses_available_width() {
+        assert_eq!(content_default_width(true), None);
+    }
+}
