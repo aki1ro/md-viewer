@@ -1646,6 +1646,28 @@ impl CommonMarkCache {
         self.header_positions.insert(normalized_key.to_string(), content_y);
     }
 
+    /// Record a header's already-content-relative y directly (no offset addition).
+    /// The bootstrap path uses this with `y = cursor.y - ui.min_rect().top()`,
+    /// which is invariant under scroll (cursor and min_rect both shift with
+    /// `state.offset.y`). The other entry point — `record_header_position` —
+    /// is for `show_viewport`, whose cursor is already viewport-relative so
+    /// the offset addition is needed.
+    pub fn record_header_content_y(&mut self, normalized_key: &str, content_y: f32) {
+        self.header_positions.insert(normalized_key.to_string(), content_y);
+    }
+
+    /// Same as `record_header_content_y` but only stores if the key isn't
+    /// already recorded. Subsequent paints can produce drifted y values
+    /// (image-load completion, font-metric resolution, etc.) — pinning the
+    /// first sighting keeps the cache stable and matches what the user sees
+    /// in the layout that was first painted. Reflow events invalidate via
+    /// `clear_header_positions`.
+    pub fn record_header_content_y_if_absent(&mut self, normalized_key: &str, content_y: f32) {
+        self.header_positions
+            .entry(normalized_key.to_string())
+            .or_insert(content_y);
+    }
+
     /// Get the y-position of a header by its normalized title (content-relative).
     /// Returns None if the header hasn't been rendered yet.
     /// The `normalized_key` should be a pre-computed lowercase key for the header title.

@@ -52,25 +52,42 @@ pub fn delayed_events<'e>(
 pub fn delayed_events_list_item<'e>(
     events: &mut impl Iterator<Item = EventIteratorItem<'e>>,
 ) -> Vec<(pulldown_cmark::Event<'e>, Range<usize>)> {
-    let mut curr_event = events.next();
+    // The caller has just consumed the outer `Tag::Item` before invoking this
+    // helper, so we start one level deep. Nested `Tag::Item` events
+    // increment, `TagEnd::Item` events decrement. When depth would drop to
+    // zero we return — the matching outer `TagEnd::Item` (and everything
+    // inside the item, including nested lists) is captured.
+    //
+    // The previous implementation returned at the FIRST `TagEnd::Item`. When
+    // an item contained a nested sub-list, that was the inner item's close
+    // and the remainder of the outer item (further inner items, the inner
+    // `TagEnd::List`, and the outer `TagEnd::Item`) leaked back to the outer
+    // render loop. Two consequences followed:
+    //   1. The outer loop processed those leaked events without the matching
+    //      parent state, eventually calling `List::start_item` with an empty
+    //      stack and panicking via `unreachable!()`.
+    //   2. The leaked events were registered as `show_scrollable` split
+    //      points; on later paints the viewport-skip path landed iteration
+    //      mid-list, reproducing the same panic.
+    let mut depth: i32 = 1;
     let mut total_events = Vec::new();
-    loop {
-        if let Some(event) = curr_event.take() {
-            total_events.push(event.1.clone());
-            if let (_, (pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Item), _range)) = event {
+    for (_, (event, range)) in events {
+        let is_item_start =
+            matches!(&event, pulldown_cmark::Event::Start(pulldown_cmark::Tag::Item));
+        let is_item_end =
+            matches!(&event, pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Item));
+        total_events.push((event, range));
+        if is_item_start {
+            depth += 1;
+        } else if is_item_end {
+            depth -= 1;
+            if depth <= 0 {
                 return total_events;
             }
-
-            if let (_, (pulldown_cmark::Event::Start(pulldown_cmark::Tag::List(_)), _range)) = event
-            {
-                return total_events;
-            }
-        } else {
-            return total_events;
         }
-
-        curr_event = events.next();
     }
+    // Iterator drained before the matching close — return what we collected.
+    total_events
 }
 
 type Column<'e> = Vec<(pulldown_cmark::Event<'e>, Range<usize>)>;
@@ -200,4 +217,119 @@ pub fn parser_options() -> Options {
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_DEFINITION_LIST
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    /// Helper: parse markdown, advance the iterator past the first `Tag::Item`
+    /// (mirroring what `event()` does for `Tag::Item` before `item_list_wrapping`
+    /// is called), then return the iterator positioned to feed
+    /// `delayed_events_list_item`.
+    fn parse_advance_past_first_item(
+        md: &str,
+    ) -> (
+        Vec<(Event<'static>, std::ops::Range<usize>)>,
+        usize,
+    ) {
+        let events: Vec<_> = Parser::new_ext(md, parser_options())
+            .into_offset_iter()
+            .map(|(e, r)| (e.into_static(), r))
+            .collect();
+        // Find the first Tag::Item, advance past it.
+        let pos = events
+            .iter()
+            .position(|(e, _)| matches!(e, Event::Start(Tag::Item)))
+            .expect("test markdown must contain at least one list item");
+        (events, pos + 1)
+    }
+
+    #[test]
+    fn delayed_events_list_item_simple_item() {
+        let md = "- alpha\n- beta\n";
+        let (events, start) = parse_advance_past_first_item(md);
+        let mut iter = events
+            .clone()
+            .into_iter()
+            .enumerate()
+            .skip(start);
+        let collected = delayed_events_list_item(&mut iter);
+        // Should contain the contents of the FIRST item and stop AT the
+        // matching `TagEnd::Item` for it (inclusive).
+        assert!(
+            matches!(
+                collected.last(),
+                Some((Event::End(TagEnd::Item), _))
+            ),
+            "expected last event to be TagEnd::Item, got {:?}",
+            collected.last()
+        );
+        // The next item start should still be in the iterator (not consumed).
+        let next = iter.next();
+        assert!(
+            matches!(next, Some((_, (Event::Start(Tag::Item), _)))),
+            "expected next iterator event to be Tag::Item for the second item, got {next:?}"
+        );
+    }
+
+    #[test]
+    fn delayed_events_list_item_nested_sublist() {
+        // Outer item 1 contains a nested sub-list with two items, then there
+        // is a second outer item. The pre-fix implementation stopped at the
+        // FIRST `TagEnd::Item` (the inner item's close), leaking the rest of
+        // outer-item-1 (the inner list close and the outer-item-1 close) back
+        // to the caller's iterator.
+        let md = "\
+- outer-1
+  - inner-1a
+  - inner-1b
+- outer-2
+";
+        let (events, start) = parse_advance_past_first_item(md);
+        let mut iter = events
+            .clone()
+            .into_iter()
+            .enumerate()
+            .skip(start);
+        let collected = delayed_events_list_item(&mut iter);
+
+        // The captured slice must include the inner list's close (otherwise
+        // the renderer's state stays inconsistent across iterations).
+        let saw_inner_end_list = collected
+            .iter()
+            .any(|(e, _)| matches!(e, Event::End(TagEnd::List(_))));
+        assert!(
+            saw_inner_end_list,
+            "collected events must include the inner list close: {collected:?}"
+        );
+
+        // It must stop AT the outer item's `TagEnd::Item`, so the last entry
+        // is `TagEnd::Item` and after it the outer iterator yields the next
+        // outer item's start.
+        assert!(
+            matches!(collected.last(), Some((Event::End(TagEnd::Item), _))),
+            "last event must be the outer item's close, got {:?}",
+            collected.last()
+        );
+        let next = iter.next();
+        assert!(
+            matches!(next, Some((_, (Event::Start(Tag::Item), _)))),
+            "after returning, the outer iterator must be positioned at the second outer item; got {next:?}"
+        );
+    }
+
+    #[test]
+    fn delayed_events_list_item_drained_iterator() {
+        // Iterator that drains before reaching a `TagEnd::Item` must return
+        // the partial collection without panicking.
+        let events: Vec<(Event<'static>, std::ops::Range<usize>)> = vec![
+            (Event::Text("orphaned".into()), 0..8),
+            (Event::SoftBreak, 8..9),
+        ];
+        let mut iter = events.into_iter().enumerate();
+        let collected = delayed_events_list_item(&mut iter);
+        assert_eq!(collected.len(), 2);
+    }
 }

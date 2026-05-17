@@ -793,3 +793,100 @@ fn forward_wheel_to_horizontal_scroll<R>(
 ```
 **Why `State` is `Copy`:** egui's `ScrollArea::State` is `#[derive(Copy)]`, so `out.state.store(ctx, id)` copies and stores — the caller's `out.state` stays accessible after.
 **Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (`forward_wheel_to_horizontal_scroll`, both table call sites)
+
+### `delayed_events_list_item` must depth-track nested items
+**Context:** v0.1.8 — `panicked at lib.rs:566 unreachable!()` in `List::start_item` when scrolling past a nested list in `show_scrollable`. Reproduced on `Recent-Changes.md` (7481 lines, 272 nested-list items).
+**Root cause:** `delayed_events_list_item` at `egui_commonmark_backend/src/pulldown.rs:52-74` stopped at the **first** `TagEnd::Item`. For an outer item containing a nested sub-list, that's the *inner* item's close — the rest of the outer item (more inner items, the inner `TagEnd::List`, and the outer `TagEnd::Item`) leaked back to the outer `show()` event loop, where they were registered as `show_scrollable` split-points. On later paints the viewport-skip path landed iteration at one of those mid-list events; `CommonMarkViewerInternal::new()` produced a fresh `self.list` per frame, so `Tag::Item` hit `start_item` with an empty stack and panicked.
+**Half-mitigation that didn't work:** the existing line 64-67 early-exit on inner `Tag::List` start; by the time it fired the renderer already had the inner level pushed and the leak was set up.
+**Fix:** depth-track. Start depth at 1 (caller already consumed the outer `Tag::Item`), `Tag::Item` increments, `TagEnd::Item` decrements, return when depth ≤ 0:
+```rust
+let mut depth: i32 = 1;
+let mut total_events = Vec::new();
+for (_, (event, range)) in events {
+    let is_item_start = matches!(&event, Event::Start(Tag::Item));
+    let is_item_end   = matches!(&event, Event::End(TagEnd::Item));
+    total_events.push((event, range));
+    if is_item_start { depth += 1; }
+    else if is_item_end { depth -= 1; if depth <= 0 { return total_events; } }
+}
+total_events  // EOF before balance — defensive, can't crash
+```
+**Apply to `delayed_events` (generic) too:** the same structural bug exists for nested blockquotes and nested def-list-definitions; it produces visible rendering glitches rather than panics (those containers don't have a stack that can be popped past zero). Deferred — track in `docs/devlog/027`.
+**Files:** `crates/egui_commonmark/egui_commonmark_backend/src/pulldown.rs` (`delayed_events_list_item`)
+
+### Math-feature parser-options mismatch between `show()` and `show_scrollable()`
+**Context:** Same panic class as the nested-list bug above. Even after depth-tracking was applied, a second independent path produced the same `lib.rs:566 unreachable!()` crash.
+**Root cause:** `show()` parses with `parser_options_math(options.math_fn.is_some() || cfg!(feature = "math"))` (parsers/pulldown.rs:461). `show_scrollable()` parses with `parser_options_math(options.math_fn.is_some())` (parsers/pulldown.rs:565). md-viewer enables the `math` cargo feature, so the two parses produced *different* event streams for any document containing `$…$` (currency `$0.02`, env vars `${ENV}`, regex). Split-points were registered with indices into `cache.cached_events` (with-math, from `show()`); the viewport-skip path consumes `sc.events` (without-math, from `show_scrollable()`). The two indices diverge on real docs; iteration jumps to an unrelated event — often `Tag::Item` with no matching `Tag::List` start — panic.
+**Fix:** mirror `show()`'s derivation in `show_scrollable()`'s parse so the two event streams are identical:
+```rust
+let math_enabled = options.math_fn.is_some() || cfg!(feature = "math");
+sc.events = Parser::new_ext(text, parser_options_math(math_enabled)).into_offset_iter()...;
+```
+**Diagnostic that would have caught it sooner:** dump `sc.events[ev_idx]` for each entry in `sc.split_points`. If the kind is `Tag::*` (Start) rather than `Event::End`, the two parses have diverged — they were populated against different event streams.
+**Better long-term:** consolidate the two parses into one source so the divergence can't reappear. An `Arc<Vec<…>>` shared field on `CommonMarkCache` would also save the duplicated event storage (~tens of MB on large docs).
+**Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (`show_scrollable` cache-population branch)
+
+### Split-points must be gated on renderer container state
+**Context:** Defense-in-depth for the two bugs above. Even with `delayed_events_list_item` correctly depth-tracking and the math options aligned, if a future helper leaks events back to the outer loop or a similar discrepancy appears, `show_scrollable`'s viewport-skip path can still land iteration mid-container — and the renderer state isn't replayed.
+**Root cause:** `is_block_end_tag` accepts `TagEnd::Item`, `TagEnd::List`, etc. unconditionally as block-end sites. The push gate didn't check whether the renderer (after `process_event` ran) was *currently inside* a list/table/blockquote.
+**Fix:** AND in the container-state check **after** `process_event` runs (since that's where the state updates):
+```rust
+let is_block_end = matches!(&e, Event::End(end) if is_block_end_tag(end));
+self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
+let safe_for_split = is_block_end
+    && !self.list.is_inside_a_list()
+    && !self.is_table
+    && !self.is_blockquote;
+if safe_for_split && let Some(source_id) = split_points_id { /* push */ }
+```
+**Trade-off:** very long top-level lists (10k+ items) lose their internal split-points and fall back to bootstrap-full-paint for every viewport. Slow but correct — strictly preferable to a `unreachable!()` panic. Long-list virtualization (allow outer-`TagEnd::List` with paired `Tag::List` replay) is tracked as a future improvement in `docs/devlog/027`.
+**Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (`show`'s split-point push block)
+
+### Slice-clone, not Vec-clone-then-skip
+**Context:** `show_scrollable`'s viewport-clipped branch was cloning the entire parsed-events Vec every paint, then iterator-`skip`ping all but ~100 visible events. On a 29 676-event doc that was ~1565 µs/frame of allocation churn — ~9.4 % of a 60 fps frame budget — and the dominant component of "scroll feels laggy".
+**Misleading initial framing:** an `Arc<Vec<…>>` wrap looks attractive — Arc::clone is O(1). But iteration still needs to yield owned events to `process_event` (which takes `Event` by value), so each event gets cloned during iteration anyway. Total clone work is unchanged unless `process_event` is refactored to take `&Event` (which cascades through `start_tag`, `end_tag`, `event_text`, etc. — a large refactor).
+**Better insight:** `first_event_index` and `last_event_index` are computed *inside* the `show_viewport` closure from the binary-searched split-points. Move the clone inside the closure too and clone only the slice:
+```rust
+let range_end = last_event_index.min(scroll_cache.events.len());
+let events_range: Vec<_> = if first_event_index < range_end {
+    scroll_cache.events[first_event_index..range_end].to_vec()
+} else {
+    Vec::new()
+};
+// re-attach original indices for downstream consumers:
+let iter = events_range.into_iter().enumerate()
+    .map(|(offset, ev)| (offset + first_event_index, ev));
+```
+**Result:** 1565 µs → 8 µs (~196× speedup) on Recent-Changes.md. The slice-clone still clones the visible events but skips the ~29 500 we'd have thrown away. NLL releases the `scroll_cache` borrow before `process_event` re-borrows the cache mutably inside the loop.
+**Gotcha:** enumerate's counter starts at 0; the original `skip(first_event_index)` preserved absolute indices. Need `.map(|(offset, ev)| (offset + first_event_index, ev))` to keep the `if i == 0 { ... }` bootstrap-newline gate working.
+**Lesson:** before reaching for a refactor (Arc, RefCell, splitting cache layout), look at whether existing code is doing work that gets immediately discarded. *"Clone-then-skip"* is a smell.
+**Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (`show_scrollable` viewport-clipped branch)
+
+### `split_points` must store content-y, not screen-y
+**Context:** Outline-click landed at the wrong scroll target. Cached header position was correct (~279 for the title) and `pending_scroll_offset` was set correctly (229), DIAG confirmed `state.offset.y` transitioned to 229, but the visible viewport showed content from content_y≈466 (the "2026-05-17" h2 below the title) at the top.
+**Root cause:** `show()`'s split-point push at `pulldown.rs:486` and `:528` stored `ui.next_widget_position()` directly — which returns **screen-y** (coords relative to the *current* paint's `ui.min_rect().top()`, which itself shifts with scroll). Subsequent skip-paints' partition_point at `pulldown.rs:701` and `:713` compares those stored y values against `viewport.min.y` (a content-y). When the storing bootstrap ran at scroll=0 the two coord systems happened to align (off by panel chrome height, ~44px — small drift, mostly worked). But when the bootstrap was *forced* at non-zero scroll (e.g. outline-click sets `pending_scroll_offset.is_some()` which clears split_points and forces re-bootstrap at the new scroll), the stored screen-y values diverged from content-y by the scroll amount (~229px for a title-click), so the skip-paint's partition_point landed at the wrong anchor and `allocate_space(first_end_position.to_vec2())` advanced the cursor by the wrong amount, rendering content ~200px off.
+**Empirical evidence** (in-renderer DIAG_RENDER log on Recent-Changes.md):
+
+| Path | Scroll | Title screen_y | Title content_y per fmla | Visible? |
+|------|--------|----------------|--------------------------|----------|
+| First bootstrap | 0 | 323 | 279 | ✓ mid-viewport |
+| Wheel-scroll to 230 | 230 | 117 | 303 | ✓ visible |
+| Forced bootstrap after outline-click | 229 | 118 | 303 | ✓ (this frame) |
+| **Subsequent skip-paint** | 229 | **-67** | **118** | **off-screen above** |
+
+Same scroll=229, but the skip-paint after an outline-click renders title 185px higher than the same scroll position via wheel — because the split_points used by the skip-paint were stored at scroll=229 with screen-y values.
+**Fix:** subtract `ui.min_rect().top()` at storage time to convert screen-y to content-y:
+```rust
+let min_top = ui.min_rect().top();
+let raw_start = ui.next_widget_position();
+let start_position = egui::pos2(raw_start.x, raw_start.y - min_top);
+// ... process_event ...
+let min_top_end = ui.min_rect().top();  // re-read defensively
+let raw_end = ui.next_widget_position();
+let end_position = egui::pos2(raw_end.x, raw_end.y - min_top_end);
+scroll_cache.split_points.push((index, start_position, end_position));
+```
+All three consumers (`pulldown.rs:701` partition, `:713` partition, `:737` `allocate_space`) naturally interpret content-y correctly: partition against `viewport.min.y`/`viewport.max.y` (both content-y), and `allocate_space(Vec2(0, content_y))` advances cursor by `content_y` from `min_rect.top()`, landing exactly at the right screen position.
+**Diagnostic that would have caught it sooner:** when `cache.get_header_position()` returns a value that disagrees with the visibly rendered position by ~scroll-amount, suspect a coord-system mismatch between storage and consumption. The DIAG_RENDER log capturing `start_y`, `min_rect_top`, `content_y` per heading per paint made the bug obvious — title's content_y was 303 in one paint and 118 in the next, both at the same nominal scroll position.
+**Bonus side-effect of fix:** at scroll=0 the storage was off by `panel_chrome_height` (~44px). Headings were therefore recorded 44px low. After the fix this drift is gone — outline-click scrolling is more precise even at scroll=0.
+**Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (`show`'s split-point push block, lines 486 + 528)

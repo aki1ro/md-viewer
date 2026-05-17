@@ -483,7 +483,17 @@ impl CommonMarkViewerInternal {
                 .peekable();
 
             while let Some((index, (e, src_span))) = events.next() {
-                let start_position = ui.next_widget_position();
+                // Convert screen-y to content-y by subtracting min_rect.top().
+                // split_points are stored once but read by skip-paints at varying
+                // scroll positions; viewport.min.y is content-y, so the stored
+                // values must be content-y to match. Otherwise — when a bootstrap
+                // is forced at non-zero scroll (e.g. outline-click sets
+                // pending_scroll_offset) — the stored screen-y values drift
+                // from content-y by the scroll amount, breaking partition_point
+                // math and rendering content at the wrong positions.
+                let min_top = ui.min_rect().top();
+                let raw_start = ui.next_widget_position();
+                let start_position = egui::pos2(raw_start.x, raw_start.y - min_top);
                 // Add a viewport-skip waypoint at every block-level end (not
                 // just list-internal ends as the original code did). Without
                 // this, docs whose content is mostly headings + paragraphs
@@ -491,7 +501,7 @@ impl CommonMarkViewerInternal {
                 // back to Pos2::ZERO, and rendered content overlaps. This is
                 // the root cause of the "buggy in scenarios more complex
                 // than the example application" warning on show_scrollable.
-                let should_add_split_point = matches!(
+                let is_block_end = matches!(
                     &e,
                     pulldown_cmark::Event::End(end) if is_block_end_tag(end)
                 );
@@ -502,10 +512,36 @@ impl CommonMarkViewerInternal {
 
                 self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
 
+                // Defense in depth: only add a split point when we're at a
+                // block end AND outside any stateful container (list, table,
+                // blockquote). The viewport-skip path in `show_scrollable`
+                // recreates the renderer with `CommonMarkViewerInternal::new`
+                // each frame, so the transient state of `self.list`,
+                // `self.is_table`, and `self.is_blockquote` is *not* replayed
+                // when iteration jumps in via `skip(first_event_index)`. A
+                // split point inside one of those containers would land
+                // iteration mid-state — for lists this fires
+                // `List::start_item` on an empty stack and panics
+                // (`lib.rs:566 unreachable!()`); for tables / blockquotes it
+                // would visually corrupt rendering. The container-state
+                // check below must run after `process_event` (above) since
+                // that's where the start/end of these containers updates
+                // `self.list` / `self.is_table` / `self.is_blockquote`.
+                let safe_for_split = is_block_end
+                    && !self.list.is_inside_a_list()
+                    && !self.is_table
+                    && !self.is_blockquote;
+
                 if let Some(source_id) = split_points_id {
-                    if should_add_split_point {
+                    if safe_for_split {
                         let scroll_cache = scroll_cache(cache, &source_id);
-                        let end_position = ui.next_widget_position();
+                        // Same content-y conversion as start_position above —
+                        // re-read min_top in case process_event nested-allocated
+                        // something that affected it (defensive; in practice the
+                        // ScrollArea's min_rect.top() doesn't change mid-paint).
+                        let min_top_end = ui.min_rect().top();
+                        let raw_end = ui.next_widget_position();
+                        let end_position = egui::pos2(raw_end.x, raw_end.y - min_top_end);
 
                         let split_point_exists = scroll_cache
                             .split_points
@@ -557,12 +593,28 @@ impl CommonMarkViewerInternal {
         // The big win either way is avoiding pulldown_cmark::Parser::new_ext +
         // collect on every frame (~52 ms at 100k lines).
         let version = content_version.unwrap_or_else(|| Self::hash_content(text));
+        let mut content_changed = false;
         {
             let sc = scroll_cache(cache, &source_id);
             if sc.events.is_empty() || sc.content_version != version {
+                content_changed = true;
+                // Must mirror `show()`'s `math_enabled` derivation
+                // (parsers/pulldown.rs in this file: `options.math_fn.is_some()
+                // || cfg!(feature = "math")`). The bootstrap branch below
+                // calls `self.show()` which parses again with `cfg!(feature =
+                // "math")` included; if our parse here omits it, the two
+                // event streams diverge for any document containing `$…$`
+                // (currency, regex, env vars). split_points are then indexed
+                // off `cache.cached_events` (with-math) but consumed against
+                // `sc.events` (without-math), so the viewport-skip path lands
+                // iteration at an unrelated event — often `Tag::Item` with no
+                // matching `Tag::List` start → `List::start_item` panics
+                // (`lib.rs:566 unreachable!()`). See docs/devlog/027.
+                let math_enabled =
+                    options.math_fn.is_some() || cfg!(feature = "math");
                 sc.events = pulldown_cmark::Parser::new_ext(
                     text,
-                    parser_options_math(options.math_fn.is_some()),
+                    parser_options_math(math_enabled),
                 )
                 .into_offset_iter()
                 .map(|(e, r)| (e.into_static(), r))
@@ -595,6 +647,12 @@ impl CommonMarkViewerInternal {
                 sc.page_size = None;
                 sc.split_points.clear();
             }
+        }
+        // Header positions are content-keyed; new content means the cached
+        // y values point at the wrong headings. Done outside the `sc` borrow
+        // scope above so `cache` is reborrowable.
+        if content_changed {
+            cache.clear_header_positions();
         }
 
         // Helper: build the renderer-owned ScrollArea with caller config.
@@ -629,13 +687,7 @@ impl CommonMarkViewerInternal {
             return out;
         };
 
-        // Clone owned events out of the cache so we can iterate while
-        // process_event mutably borrows the cache for syntect/header state.
-        // The clone is O(events) but uses Event<'static>'s cheap refcounted
-        // CowStr internals — measured ~11 ms at 100k lines vs ~52 ms parse.
-        let events = scroll_cache(cache, &source_id).events.clone();
-
-        let num_rows = events.len();
+        let num_rows = scroll_cache(cache, &source_id).events.len();
 
         make_scroll_area()
             .show_viewport(ui, |ui, viewport| {
@@ -681,14 +733,33 @@ impl CommonMarkViewerInternal {
                         .map(|(index, _, _)| *index)
                         .unwrap_or(num_rows);
 
+                    // Clone only the events we'll actually iterate this frame
+                    // — the visible viewport plus safety margins above/below.
+                    // The previous implementation cloned the full Vec (~1.5 ms
+                    // at 30k events on Recent-Changes.md), then `skip`ed all
+                    // but ~150 events. This trims the clone to the actual
+                    // range used, dropping per-frame allocation churn from
+                    // ~1.5 ms to ~10 µs on the same doc. The slice clone is
+                    // released before `process_event` mutably re-borrows the
+                    // cache for syntect/header state — NLL covers this.
+                    let range_end = last_event_index.min(scroll_cache.events.len());
+                    let events_range: Vec<(pulldown_cmark::Event<'static>, Range<usize>)> =
+                        if first_event_index < range_end {
+                            scroll_cache.events[first_event_index..range_end].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+
                     ui.allocate_space(first_end_position.to_vec2());
 
-                    // only rendering the elements that are inside the viewport
-                    let mut events = events
+                    // Re-attach original indices via map so peekable iteration
+                    // and downstream consumers still see the absolute event
+                    // index (used by `if i == 0 { ... }` below for the
+                    // bootstrap-newline gate).
+                    let mut events = events_range
                         .into_iter()
                         .enumerate()
-                        .skip(first_event_index)
-                        .take(last_event_index - first_event_index)
+                        .map(|(offset, ev)| (offset + first_event_index, ev))
                         .peekable();
 
                     while let Some((i, (e, src_span))) = events.next() {
@@ -1392,7 +1463,30 @@ impl CommonMarkViewerInternal {
                             format!("{normalized}#{nth}")
                         };
                         *nth += 1;
-                        cache.record_header_position(&key, y);
+                        // `y` (== `ui.cursor().top()` at heading start) is a
+                        // SCREEN-y coordinate. The click handler uses the
+                        // cached value with `ScrollArea::vertical_scroll_offset(N)`,
+                        // which interprets N as a CONTENT-y (where 0 is the
+                        // top of the ScrollArea's content layout). Subtract
+                        // `ui.min_rect().top()` — that's the screen y of the
+                        // closure's ui top-left, which tracks the current
+                        // scroll offset (it shifts up as the user scrolls).
+                        // The subtraction cancels out both the panel chrome
+                        // AND any active scroll offset, leaving a pure
+                        // content-y that's invariant across scroll positions.
+                        //
+                        // Empirical verification on Recent-Changes.md:
+                        // - At scroll=0: title cursor=323, min_rect.top()=44
+                        //   → content_y = 279
+                        // - After click to scroll=273: cursor=50,
+                        //   min_rect.top()=-229 → content_y = 279
+                        // - Same heading, same content_y, regardless of scroll
+                        //
+                        // Previously stored `cur_offset + cursor.y` which gave
+                        // 323 (off by 44 = panel chrome height), so scrolling
+                        // to (323-50)=273 landed 44 px past the heading.
+                        let content_y = y - ui.min_rect().top();
+                        cache.record_header_content_y_if_absent(&key, content_y);
                     }
                 }
                 self.current_heading_text.clear();
