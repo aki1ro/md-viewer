@@ -483,17 +483,7 @@ impl CommonMarkViewerInternal {
                 .peekable();
 
             while let Some((index, (e, src_span))) = events.next() {
-                // Convert screen-y to content-y by subtracting min_rect.top().
-                // split_points are stored once but read by skip-paints at varying
-                // scroll positions; viewport.min.y is content-y, so the stored
-                // values must be content-y to match. Otherwise — when a bootstrap
-                // is forced at non-zero scroll (e.g. outline-click sets
-                // pending_scroll_offset) — the stored screen-y values drift
-                // from content-y by the scroll amount, breaking partition_point
-                // math and rendering content at the wrong positions.
-                let min_top = ui.min_rect().top();
-                let raw_start = ui.next_widget_position();
-                let start_position = egui::pos2(raw_start.x, raw_start.y - min_top);
+                let start_position = ui.next_widget_position();
                 // Add a viewport-skip waypoint at every block-level end (not
                 // just list-internal ends as the original code did). Without
                 // this, docs whose content is mostly headings + paragraphs
@@ -535,13 +525,7 @@ impl CommonMarkViewerInternal {
                 if let Some(source_id) = split_points_id {
                     if safe_for_split {
                         let scroll_cache = scroll_cache(cache, &source_id);
-                        // Same content-y conversion as start_position above —
-                        // re-read min_top in case process_event nested-allocated
-                        // something that affected it (defensive; in practice the
-                        // ScrollArea's min_rect.top() doesn't change mid-paint).
-                        let min_top_end = ui.min_rect().top();
-                        let raw_end = ui.next_widget_position();
-                        let end_position = egui::pos2(raw_end.x, raw_end.y - min_top_end);
+                        let end_position = ui.next_widget_position();
 
                         let split_point_exists = scroll_cache
                             .split_points

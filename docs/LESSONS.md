@@ -862,9 +862,11 @@ let iter = events_range.into_iter().enumerate()
 **Lesson:** before reaching for a refactor (Arc, RefCell, splitting cache layout), look at whether existing code is doing work that gets immediately discarded. *"Clone-then-skip"* is a smell.
 **Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (`show_scrollable` viewport-clipped branch)
 
-### `split_points` must store content-y, not screen-y
-**Context:** Outline-click landed at the wrong scroll target. Cached header position was correct (~279 for the title) and `pending_scroll_offset` was set correctly (229), DIAG confirmed `state.offset.y` transitioned to 229, but the visible viewport showed content from content_y≈466 (the "2026-05-17" h2 below the title) at the top.
-**Root cause:** `show()`'s split-point push at `pulldown.rs:486` and `:528` stored `ui.next_widget_position()` directly — which returns **screen-y** (coords relative to the *current* paint's `ui.min_rect().top()`, which itself shifts with scroll). Subsequent skip-paints' partition_point at `pulldown.rs:701` and `:713` compares those stored y values against `viewport.min.y` (a content-y). When the storing bootstrap ran at scroll=0 the two coord systems happened to align (off by panel chrome height, ~44px — small drift, mostly worked). But when the bootstrap was *forced* at non-zero scroll (e.g. outline-click sets `pending_scroll_offset.is_some()` which clears split_points and forces re-bootstrap at the new scroll), the stored screen-y values diverged from content-y by the scroll amount (~229px for a title-click), so the skip-paint's partition_point landed at the wrong anchor and `allocate_space(first_end_position.to_vec2())` advanced the cursor by the wrong amount, rendering content ~200px off.
+### `split_points` coord system: screen-y works, content-y conversion broke deep scrolling (REGRESSION TRACKING)
+**Context:** Outline-click on a far heading lands the scroll target ~hundreds of px off. `pulldown.rs:486` and `:528` push split_points using `ui.next_widget_position()`, which returns **screen-y** coordinates. The skip-paint at `:701` and `:713` then compares those screen-y values against `viewport.min.y` (a content-y). At scroll=0 the two coord systems differ only by panel chrome height (~44px — small enough that outline-click is *slightly* imprecise but works); when the bootstrap is *forced* at non-zero scroll via `pending_scroll_offset.is_some()` clearing split_points, the new storage is at the scroll-shifted screen-y, off from content-y by the scroll amount. Subsequent skip-paints land at the wrong anchor.
+
+**Attempted fix that regressed**: converting both `start_position` and `end_position` to content-y by subtracting `ui.min_rect().top()` at storage. This made outline-click land correctly. **BUT** it caused blank-content rendering at deep scroll positions in `full_width_content=true` mode on docs with mixed tables / code blocks / ASCII art. The cursor math after `allocate_space(first_end_position.to_vec2())` landed differently — apparently the consumer side wasn't fully content-y-aware, or there's a width-dependent layout interaction the fix didn't account for. Build at commit 4b13e25 had the content-y conversion; commit reverted in a follow-up. Lesson: the screen-y storage was a load-bearing pseudo-constant that other code paths depended on — full audit of all consumers needed before changing.
+
 **Empirical evidence** (in-renderer DIAG_RENDER log on Recent-Changes.md):
 
 | Path | Scroll | Title screen_y | Title content_y per fmla | Visible? |
@@ -875,18 +877,10 @@ let iter = events_range.into_iter().enumerate()
 | **Subsequent skip-paint** | 229 | **-67** | **118** | **off-screen above** |
 
 Same scroll=229, but the skip-paint after an outline-click renders title 185px higher than the same scroll position via wheel — because the split_points used by the skip-paint were stored at scroll=229 with screen-y values.
-**Fix:** subtract `ui.min_rect().top()` at storage time to convert screen-y to content-y:
-```rust
-let min_top = ui.min_rect().top();
-let raw_start = ui.next_widget_position();
-let start_position = egui::pos2(raw_start.x, raw_start.y - min_top);
-// ... process_event ...
-let min_top_end = ui.min_rect().top();  // re-read defensively
-let raw_end = ui.next_widget_position();
-let end_position = egui::pos2(raw_end.x, raw_end.y - min_top_end);
-scroll_cache.split_points.push((index, start_position, end_position));
-```
-All three consumers (`pulldown.rs:701` partition, `:713` partition, `:737` `allocate_space`) naturally interpret content-y correctly: partition against `viewport.min.y`/`viewport.max.y` (both content-y), and `allocate_space(Vec2(0, content_y))` advances cursor by `content_y` from `min_rect.top()`, landing exactly at the right screen position.
-**Diagnostic that would have caught it sooner:** when `cache.get_header_position()` returns a value that disagrees with the visibly rendered position by ~scroll-amount, suspect a coord-system mismatch between storage and consumption. The DIAG_RENDER log capturing `start_y`, `min_rect_top`, `content_y` per heading per paint made the bug obvious — title's content_y was 303 in one paint and 118 in the next, both at the same nominal scroll position.
-**Bonus side-effect of fix:** at scroll=0 the storage was off by `panel_chrome_height` (~44px). Headings were therefore recorded 44px low. After the fix this drift is gone — outline-click scrolling is more precise even at scroll=0.
+
+**Open future work:**
+1. Audit ALL split_points consumers to confirm whether they interpret values as screen-y or content-y. The `allocate_space(first_end_position.to_vec2())` call at `:737` advances the cursor by Y; the right value depends on whether the cursor's reference frame uses screen-y or content-y semantics. Compile-time enforcement of the coord system (newtype wrapper around `f32`) would prevent future regressions.
+2. Alternative outline-click fix: avoid forced bootstraps at non-zero scroll. E.g., scroll-to-zero, run bootstrap, then snap back to target scroll. Costs two extra frames but the split_points stay valid forever.
+3. Alternative fix: store the bootstrap scroll alongside each split_point (4-tuple instead of 3-tuple), have skip-paint compensate via `end.y - bootstrap_scroll + viewport.scroll`. More complex but doesn't change semantic.
+
 **Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (`show`'s split-point push block, lines 486 + 528)
