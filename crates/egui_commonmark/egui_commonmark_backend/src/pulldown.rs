@@ -21,6 +21,13 @@ pub struct ScrollableCache {
     /// theme is_dark). When this changes, split_points must be cleared —
     /// their y-positions are no longer valid for the new layout.
     pub layout_signature: u64,
+    /// Content height as reported by the previous frame's ScrollAreaOutput.
+    /// Folded into the layout signature (quantized to 1024-px buckets) so
+    /// that significant content-height growth — typically from async image
+    /// or font loading shifting where blocks fall — triggers a single
+    /// re-bootstrap to refresh split_points y-positions. Sub-pixel jitter
+    /// from continuous async work stays in one bucket and doesn't churn.
+    pub last_content_h: f32,
 }
 
 pub type EventIteratorItem<'e> = (usize, (pulldown_cmark::Event<'e>, Range<usize>));

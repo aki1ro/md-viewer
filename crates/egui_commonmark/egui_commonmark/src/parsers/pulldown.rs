@@ -333,7 +333,11 @@ fn parser_options_math(is_math_enabled: bool) -> pulldown_cmark::Options {
 /// block) only watched `available_size`, so zooming (Ctrl++/-) or toggling
 /// dark mode would leave stale split_points in place and the viewport-skip
 /// math would render the wrong content range.
-fn compute_layout_signature(ui: &egui::Ui, options: &CommonMarkOptions) -> u64 {
+fn compute_layout_signature(
+    ui: &egui::Ui,
+    options: &CommonMarkOptions,
+    last_content_h: f32,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     // Width drives wrap and is the dominant layout input. Quantize to the
@@ -354,6 +358,15 @@ fn compute_layout_signature(ui: &egui::Ui, options: &CommonMarkOptions) -> u64 {
     // Caller-configured constraints that affect block widths.
     options.default_width.hash(&mut h);
     options.indentation_spaces.hash(&mut h);
+    // Previous-frame content height, bucketed at 1024 px. When async image
+    // / font loading grows the doc by ≥1024 px after the initial bootstrap,
+    // the bucket flips and triggers a single re-bootstrap so split_points
+    // get re-recorded at the correct (post-load) y values. Without this,
+    // skip-paint's partition_point uses stale y values; with viewport.min.y
+    // larger than the stale stored anchors, it picks first_event_index too
+    // deep in the doc and leaves empty space at the viewport top (or bottom
+    // when scrolling the other direction).
+    ((last_content_h / 1024.0).round() as i32).hash(&mut h);
     h.finish()
 }
 
@@ -569,7 +582,8 @@ impl CommonMarkViewerInternal {
     ) -> egui::scroll_area::ScrollAreaOutput<()> {
         let available_size = ui.available_size();
         let scroll_id = source_id.with("_scroll_area");
-        let layout_sig = compute_layout_signature(ui, options);
+        let last_content_h = scroll_cache(cache, &source_id).last_content_h;
+        let layout_sig = compute_layout_signature(ui, options, last_content_h);
 
         // Ensure parsed events are cached on the ScrollableCache, keyed by a
         // content version. The caller can provide a monotonic version (bumped
@@ -681,13 +695,19 @@ impl CommonMarkViewerInternal {
                 self.show(ui, cache, options, text, Some(source_id));
             });
             // Prevent repopulating points twice at startup
-            scroll_cache(cache, &source_id).available_size = available_size;
+            let sc = scroll_cache(cache, &source_id);
+            sc.available_size = available_size;
+            // Capture content height for next-frame layout_signature: if a
+            // late image/font load grows the doc by ≥1024 px, the bucketed
+            // signature flips and the next paint re-bootstraps with refreshed
+            // split_points.
+            sc.last_content_h = out.content_size.y;
             return out;
         };
 
         let num_rows = scroll_cache(cache, &source_id).events.len();
 
-        make_scroll_area()
+        let out = make_scroll_area()
             .show_viewport(ui, |ui, viewport| {
                 ui.set_height(page_size.y);
                 // ui.cursor().top() inside show_viewport is viewport-relative;
@@ -772,7 +792,11 @@ impl CommonMarkViewerInternal {
                         }
                     }
                 });
-            })
+            });
+        // Capture content height for next-frame layout_signature (see
+        // bootstrap branch above for rationale).
+        scroll_cache(cache, &source_id).last_content_h = out.content_size.y;
+        out
         // No trailing invalidation needed — layout_signature is checked at
         // the top of show_scrollable, so a width/zoom/theme change in the
         // same frame falls into the bootstrap branch above immediately
