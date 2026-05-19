@@ -933,3 +933,95 @@ The 2 bootstraps are the initial paint + one image-load convergence. After that,
 **General lesson**: when a fluctuating value drives cache invalidation, NEVER use round/floor bucketing if the fluctuation amplitude is comparable to the bucket size. Use a Schmitt-trigger-style threshold (only flip state if change exceeds a hysteresis band wider than the noise). Bucketing fails on values that sit exactly at a boundary; hysteresis is unconditionally stable.
 
 **Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (drift check in show_scrollable's invalidation block, `CONTENT_H_DRIFT_THRESHOLD` constant), `crates/egui_commonmark/egui_commonmark_backend/src/pulldown.rs` (`bootstrap_content_h` field on ScrollableCache)
+
+### Skip-paint's `out.content_size.y` is unreliable — don't feed it to drift detection, AND clamp scroll against it
+**Context:** With hysteresis-drift detection working for the 44-px egui-internal oscillation (entry above), a separate failure mode appeared on the Dockerfile Deep Dive doc (1574 lines, mixed code blocks + tables): panel flickered between blank and rendered with weird styling when scrolling deep. The hysteresis fix prevented the bucketing oscillation but didn't address THIS pattern.
+
+**DIAG data** (619 bootstraps in 30 s of scroll, vs the previous fix's 2-3):
+```
+[SKIP_END] scroll=30911 content_h=62527 drift=27966    ← skip-paint reports double the real content_h
+[BOOT]     scroll=30924 content_h=34539 first_sp_y=-30846  ← invalidation fires → bootstrap at non-zero scroll
+[SKIP]     vp=[30924,31648] evt=[2503,2514]/2514 sp_y=[3612,0]  ← new split_points have garbage screen-y
+[SKIP_END] scroll=2948 content_h=3672 drift=-30867     ← scroll bounced back, content_h collapsed
+[BOOT]     scroll=2954 ...
+... 600+ more ...
+```
+
+**Why content_size.y inflates to ~2×:** `show_viewport`'s closure does `ui.set_height(page_size.y)` (sets minimum) then `ui.allocate_space(first_end_position.to_vec2())` (advances cursor by `first_end_position.y` which is the stored split_point y, e.g. 30775 at deep scroll). The two together extend the inner UI's content size past `page_size.y`. egui reports `out.content_size.y = first_end_position.y + rendered_events_height + chrome ≈ 68246` when real content is ~34604.
+
+**Two cascading failures from that one inflation:**
+1. **Drift-detection death spiral.** The inflated 68246 vs the bootstrap 34608 produces drift ≈ +33000, way past the 1024 hysteresis threshold → invalidate split_points + page_size → re-bootstrap fires at the current non-zero scroll → bootstrap repopulates split_points with screen-y values that include the negative scroll offset (e.g., `first_sp_y=-30846`) → the next skip-paint's `partition_point` against these garbage y-coords picks events from the END of the doc instead of the middle → renders ~10 events when it should render ~100 → content_size.y now collapses to a few thousand → drift spikes the other way → re-bootstrap fires again. Steady-state of ~20 BOOT cycles/sec. User sees flicker + scrambled rendering.
+2. **Scroll-overshoot blank panel.** Even without invalidation firing, the inflated content_size.y lets egui's ScrollArea accept scroll offsets up to `content_size.y - viewport_height ≈ 67500` — much larger than the real maximum (real_content - viewport ≈ 33880). User wheel-scrolls past 33880, the viewport falls into the "phantom" lower half of the inflated content where no events render → blank middle panel.
+
+**Fix (two complementary one-liners; both are required):**
+```rust
+// Skip-paint exit:
+// 1. Do NOT update last_content_h from out.content_size.y.
+//    last_content_h is set only by bootstrap. Drift detection then
+//    compares bootstrap-to-bootstrap content_h only, never false-positives
+//    on skip-paint's inflated value.
+// (the previous `scroll_cache(cache, &source_id).last_content_h = out.content_size.y;` line is removed)
+
+// 2. Clamp scroll against the bootstrap-authoritative `page_size.y`.
+let real_max_scroll = (page_size.y - out.inner_rect.height()).max(0.0);
+if out.state.offset.y > real_max_scroll {
+    let mut state = out.state;
+    state.offset.y = real_max_scroll;
+    state.store(ui.ctx(), out.id);
+    ui.ctx().request_repaint();
+}
+```
+
+**Empirical verification** (T470, Dockerfile Deep Dive, 350-wheel-deep scroll test):
+
+| Build | BOOT count | Max content_h seen | Max scroll | Flicker |
+|---|---|---|---|---|
+| Pre-fix (hysteresis only) | **619** | 62527 | 34030 (overshoot) | Yes, ~20 cycles/sec |
+| Fix 1 only (no drift signal from skip) | 3 | 68246 | 34030 (still overshoots) | No, but blank at scroll>33880 |
+| Fix 1 + Fix 2 (clamp) | 3 | 68246 | 34022→clamped to 33880 | No |
+
+**General lesson:** when one stored quantity is the authoritative source of truth (here: `page_size.y` from bootstrap), don't let derived/observed values from a different code path (here: `out.content_size.y` from skip-paint) feed back into anything that affects state. Treat the skip-paint output as a paint-only artifact, not a measurement.
+
+**Why simpler alternatives don't work:**
+- Removing `ui.allocate_space(first_end_position.to_vec2())` — events would render at content-y=0 in the inner UI, but the scroll position math expects them at first_end_position.y. Content would appear pinned to the top regardless of scroll.
+- Replacing `set_height` with `set_max_size` — egui doesn't enforce strict max on Ui sizing; widgets that exceed allocation just overflow.
+- Setting `state.offset.y` clamp BEFORE rendering — would clamp every frame even when content_size.y is accurate, breaking edge cases (e.g., during a real layout_signature change). Post-render clamp keeps the per-frame invariant correct.
+
+**Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (skip-paint exit block in `show_scrollable`)
+
+### Skip-paint virtualization had unfixable-in-band layout bugs; disabled in favor of always-bootstrap
+**Context:** Session 029 — user reported persistent flicker + wrong spacing + code-block indentation shifted right during scroll on T470, even after fixes B+C+D from the previous LESSONS entry. DIAG showed the renderer was in steady state (no death spiral, no clamp firing, drift = 0) yet the visual output was wrong.
+
+**Root cause** (three compounding bugs):
+1. **Orphaned `Start` events**: `show_scrollable`'s slice often started at an `End(SomeBlock)` event whose matching `Start` was outside the slice. That block then didn't render. `allocate_space` advanced the cursor past where the block *would have been*, so subsequent events still landed at their bootstrap-relative y — but the missing block left a visual hole. When the hole intersected the viewport: blank patches.
+2. **`content_size.y` inflation** (already covered in prior LESSONS entry but persists): skip-paint reports content height up to 2× the real value. Even with the post-render clamp from session 028, ScrollArea's internal max-scroll math accepts overshoot before the clamp can fire next frame.
+3. **Container state at slice boundary**: existing gate excluded list/table/blockquote split-points, but not code-block end split-points or def-lists. Slicing mid-container left renderer state empty for that block.
+
+**Why patches B/C/D didn't fully resolve it:** they addressed symptoms (drift false-positives, scroll overshoot, horizontal allocate_space leak) without touching the underlying slice-orphan-Start mechanic. Visual rendering was correct at *steady-state* scroll positions where the slice happened to start at a clean boundary, but the boundary shifted with every wheel event during motion, hitting bad positions frequently enough to be perceived as continuous flicker.
+
+**Fix shipped:** force `show_scrollable` to always run the bootstrap path (`ScrollArea::show(...)` rendering the full event stream in order). Skip-paint code preserved as `unreachable!` for future restoration. Performance measured on T470:
+
+| Doc | Events | avg paint | FPS |
+|-----|--------|-----------|-----|
+| Tiny | 348 | 1.2 ms | 800+ |
+| Dockerfile (1574 lines) | 2,514 | 5.7 ms | 175 |
+| Medium synth | 3,453 | 11.4 ms | 88 |
+| Large synth (7k lines) | 20,703 | 39.0 ms | 26 |
+| Huge synth (36k lines) | 103,503 | 229 ms | 4 |
+
+Smooth ≤ ~3k events; borderline ~5–10k; laggy ~20k; near-unusable at 100k. Acceptable for typical personal use; future skip-paint rewrite needed for docs over ~10k events. Design plan in `docs/devlog/030-skip-paint-investigation.md` — three options ranked by cost.
+
+**General lesson:** when adding a "fast path" that depends on stateful renderer behavior, make sure the fast path either replays the state or starts only at strict state boundaries. The original `show_scrollable` did neither: it iterated events from an arbitrary index assuming the renderer was "fresh," but the renderer's state (heading accumulators, list-depth, code-block accumulation) requires Start events to make End events meaningful. The slicing assumption was wrong from the start; the bandaids stacked up across multiple LESSONS entries before this one didn't address it.
+
+**Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (`show_scrollable` early return to bootstrap path), `docs/devlog/030-skip-paint-investigation.md`
+
+### record_header_content_y_if_absent caused outline-click overshoot on disable-virtualization builds
+**Context:** Right after the disable-virtualization fix above, outline-click landed each header progressively further below the viewport top — the deeper the header in the doc, the larger the overshoot. Scrolling itself was now perfect; only the click target was wrong.
+
+**Root cause:** Headings record their content-y position via `cache.record_header_content_y_if_absent(&key, content_y)`. The `_if_absent` semantic pins the first paint's value. The FIRST paint happens before async font fallbacks (Noto family for non-ASCII glyphs) finish loading. Slightly different font metrics on first paint → slightly different text widths → slightly different line wrapping → cumulative content_y values diverge from the post-settle layout. Each heading's stored y is *less* than the actual y by an amount proportional to how many wrap-affected lines preceded it. Outline click reads the stored y and scrolls to `y - 50`; the actual heading is at the LATER, larger y, so the scroll target is too small and the heading appears below the viewport top.
+
+**Fix:** change to `cache.record_header_content_y` (no `_if_absent`). Every paint refreshes the recorded y with the current layout. Once fonts settle, subsequent paints write the correct values. Click reads the current correct value.
+
+**Why `_if_absent` existed:** the prior author intended "pin the first sighting so click targets are stable." Stable but stale. The right trade-off here is "always fresh," especially since the disable-virtualization fix means every paint records every heading anyway — cost is negligible.
+
+**Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs` (`TagEnd::Heading` handler — line ~1587)

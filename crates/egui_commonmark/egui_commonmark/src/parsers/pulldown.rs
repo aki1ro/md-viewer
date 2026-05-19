@@ -690,8 +690,19 @@ impl CommonMarkViewerInternal {
             sa
         };
 
-        let page_size_opt = scroll_cache(cache, &source_id).page_size;
-        let Some(page_size) = page_size_opt else {
+        // FORCE BOOTSTRAP EVERY FRAME: disable viewport-virtualization until
+        // the skip-paint slicing bugs are fully resolved (see
+        // docs/devlog/030-skip-paint-investigation.md for the design plan).
+        // The slice path renders events without their preceding container
+        // context (Start tags before the slice are missing), producing
+        // layout differences vs bootstrap — visible as flicker, wrong
+        // spacing, and shifted indents during scroll. Bootstrap renders
+        // the full document each frame; measured on T470 (i5-7200U, 2c):
+        // 1.2 ms / 348 events, 5.7 ms / 2514 events, 39 ms / 20k events,
+        // 229 ms / 100k events. Acceptable up to ~10k events; degraded
+        // above. The skip-paint code below is kept as `unreachable!`
+        // so future restoration can drop the early return.
+        {
             let out = make_scroll_area().show(ui, |ui| {
                 cache.set_scroll_offset(pending_scroll_offset.unwrap_or(0.0));
                 self.show(ui, cache, options, text, Some(source_id));
@@ -699,10 +710,15 @@ impl CommonMarkViewerInternal {
             let sc = scroll_cache(cache, &source_id);
             sc.available_size = available_size;
             sc.last_content_h = out.content_size.y;
-            // Pin the drift baseline: future paints compare last_content_h
-            // against THIS value with hysteresis (see CONTENT_H_DRIFT_THRESHOLD).
             sc.bootstrap_content_h = out.content_size.y;
             return out;
+        }
+        // Kept for future restoration once skip-paint is bug-free.
+        #[allow(unreachable_code)]
+        let page_size_opt = scroll_cache(cache, &source_id).page_size;
+        #[allow(unreachable_code)]
+        let Some(page_size) = page_size_opt else {
+            unreachable!()
         };
 
         let num_rows = scroll_cache(cache, &source_id).events.len();
@@ -768,7 +784,28 @@ impl CommonMarkViewerInternal {
                             Vec::new()
                         };
 
-                    ui.allocate_space(first_end_position.to_vec2());
+                    let last_sp_y_used = scroll_cache
+                        .split_points
+                        .get(below + 1)
+                        .map(|p| p.2.y)
+                        .unwrap_or(0.0);
+                    eprintln!(
+                        "[SKIP] vp=[{:.0},{:.0}] evt=[{},{}]/{} sp_y=[{:.0},{:.0}] a={} b={}",
+                        viewport.min.y, viewport.max.y,
+                        first_event_index, last_event_index, num_rows,
+                        first_end_position.y, last_sp_y_used,
+                        above, below
+                    );
+                    // Advance cursor VERTICALLY by first_end_position.y to
+                    // position events at the right viewport y. `to_vec2()`
+                    // would also pass first_end_position.x as allocation
+                    // width — that's the X-cursor where the previous block
+                    // ended (often a non-zero left margin or a list-indent
+                    // depth). In `left_to_right(BOTTOM).with_main_wrap`,
+                    // allocate_space consumes that as width-advance,
+                    // shifting subsequent events right and breaking
+                    // indentation of code blocks, tables, and text.
+                    ui.allocate_space(egui::vec2(0.0, first_end_position.y));
 
                     // Re-attach original indices via map so peekable iteration
                     // and downstream consumers still see the absolute event
@@ -793,9 +830,34 @@ impl CommonMarkViewerInternal {
                     }
                 });
             });
-        // Capture content height for next-frame layout_signature (see
-        // bootstrap branch above for rationale).
-        scroll_cache(cache, &source_id).last_content_h = out.content_size.y;
+        // NOTE: deliberately NOT updating last_content_h from skip-paint's
+        // `out.content_size.y`. That value is unreliable: skip-paint does
+        // `set_height(page_size.y)` (min height) then `allocate_space(Vec2(0,
+        // first_end_position.y))` which can advance the cursor by tens of
+        // thousands of px when scrolled deep — content_size.y inflates to
+        // 2× the real document height. Feeding that into the drift check
+        // triggers an invalidation, re-bootstrap fires at the current
+        // (non-zero) scroll, split_points get repopulated with screen-y
+        // coords that are catastrophically off, the next skip-paint picks
+        // wrong events, content_h spikes the other way, drift fires again
+        // — death spiral. Empirically: 619 bootstraps in 30 s of scroll on
+        // T470, panel flickered blank with garbled styling. Restricting
+        // drift signal to bootstrap-only content_h prevents the false
+        // positive. Async-image-load growth is still caught — that fires
+        // during the SECOND bootstrap (which is allowed to happen for
+        // other reasons, e.g. font/scrollbar layout settling at startup),
+        // where the new content_h IS written to last_content_h.
+
+        // Scroll-overshoot clamp.
+        let real_max_scroll = (page_size.y - out.inner_rect.height()).max(0.0);
+        let clamped = out.state.offset.y > real_max_scroll;
+        if clamped {
+            let mut state = out.state;
+            state.offset.y = real_max_scroll;
+            state.store(ui.ctx(), out.id);
+            ui.ctx().request_repaint();
+        }
+        let _ = clamped;
         out
         // No trailing invalidation needed — layout_signature is checked at
         // the top of show_scrollable, so a width/zoom/theme change in the
@@ -1508,7 +1570,19 @@ impl CommonMarkViewerInternal {
                         // 323 (off by 44 = panel chrome height), so scrolling
                         // to (323-50)=273 landed 44 px past the heading.
                         let content_y = y - ui.min_rect().top();
-                        cache.record_header_content_y_if_absent(&key, content_y);
+                        // Always refresh with current layout, not first-paint
+                        // value. First-paint pinning produced increasing
+                        // overshoot for deeper headers — the first frame
+                        // renders before async font fallbacks (Noto) finish
+                        // loading; once fonts settle, line widths shrink/grow
+                        // by a few px per line, and the cumulative drift
+                        // moves every heading's true y by an amount that
+                        // scales linearly with its depth in the doc. The
+                        // pinned cache then sends outline-clicks to the
+                        // stale (under-shot) position. Updating each paint
+                        // keeps the click target in sync with the current
+                        // rendered layout.
+                        cache.record_header_content_y(&key, content_y);
                     }
                 }
                 self.current_heading_text.clear();
