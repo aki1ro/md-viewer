@@ -2,6 +2,31 @@
 
 All notable changes to markdown-viewer will be documented in this file.
 
+## [0.1.10] - 2026-05-24
+
+### Bug Fixes
+
+- Search-active scroll lock (#19, PR #21). With the find bar open, wheel-scrolling away from the active match snapped the view back every frame, leaving the user "locked" near the result; Esc to dismiss the bar was the only workaround. Root cause: the post-render corrective scroll in `render_tab_content` was designed as stage 2 of a two-stage scroll (line-ratio estimate → snap to renderer-recorded `active_search_y`). After the disable-virtualization change in this release, the renderer started walking the full event stream every paint, and `record_active_search_y_viewport` fires unconditionally per Active highlight segment (egui's clip rect culls painting but not widget layout). So `active_search_y` became perpetually fresh, and the corrective block — which had no guard for "user just scrolled" — re-fired every frame the match was off-screen. Fix: one-shot `correct_active_search_pending: bool` on `Tab`, set by `scroll_to_active_match` and cleared after the corrective block runs once. Two-stage scroll still converges in 1–2 frames; subsequent wheel input is no longer overridden. Detail in `docs/devlog/031-search-scroll-lock.md`.
+- Nested-list rendering crash + scroll lag (4b13e25). Long docs with deeply nested lists could panic in `delayed_events_list_item` because that helper stopped at the first `TagEnd::Item` regardless of nesting depth, leaking inner-list events into the outer `show()` loop where they were registered as split-points. Fix: depth-track nested items/lists, return only when the outer item closes. Also addressed a math-feature parser-options mismatch between `show()` and `show_scrollable()` that produced inconsistent event streams whenever the doc contained `$…$` (currency, env vars, regex).
+- Outline-click scroll precision regression (#1, #2; 6eb8001). Click-on-far-heading landed each header progressively further below the viewport top on layout-changed builds. Root cause: `record_header_content_y_if_absent` pinned the first paint's value, which was computed before async font fallbacks settled. Fix: drop the `_if_absent` semantic so every paint refreshes the recorded y.
+- Scroll jitter on slow CPUs (9f02fdc). On T470-class machines, scrolling image-heavy 3 800-line docs felt extremely janky for ~30 s before settling. Root cause: `compute_layout_signature` hashed raw `f32.to_bits()` of widths and font heights; sub-pixel jitter from async image/font loading flipped the hash every frame and forced ~32 full re-bootstraps. Fix: quantize the float inputs (pixel for width, 0.1 px for font heights). Bootstraps during a 30 s scroll: 32 → 1.
+- Async-load content shift staleness (d356cc9, 809b761). When images finished loading mid-session, stored split-point y-coords went stale and viewport-skip painted wrong content. First attempt (bucket the previous content_h into layout_signature) entered a perpetual bootstrap loop because the two paint paths report content_h differing by ~44 px. Final fix: absolute-drift hysteresis with a 1 024 px threshold — only invalidate when content height shifts by more than the egui-internal oscillation amplitude.
+- Deep-scroll rendering regression revert (5fb3b71). The content-y conversion attempted in 4b13e25 fixed outline-click precision but broke deep-scroll rendering in `full_width_content=true` mode on docs with mixed tables/code blocks. Reverted to screen-y storage; outline-click instead uses the `pending_scroll_offset` non-clear pattern (see entry above).
+
+### Performance / Stability
+
+- Disabled `show_scrollable` virtualization in favor of always-bootstrap (21d43c5). The skip-paint virtualization had three independent unfixable-in-band bugs (orphan `Start` events, `content_size.y` inflation, container-state mid-slice). Symptoms were flicker, blank patches, wrong code-block indentation during scroll. Trade-off: docs ≤ ~3 k events stay smooth, ≤ ~10 k borderline, ≥ ~20 k laggy. Acceptable for typical personal use. A re-virtualization design is tracked in `docs/devlog/030-skip-paint-investigation.md`.
+
+### Internal / CI
+
+- Release pipeline hardened (044d872). `validate` job runs upfront so syntax/typo errors fail fast instead of after the long matrix build. Step-level secret gating for the optional `publish-aur` / `publish-aur-bin` / `publish-snap` / `publish-crates` jobs (GitHub Actions blocks `secrets.*` in job-level `if:`, so the pattern is a first step that writes `proceed=true|false` to `$GITHUB_OUTPUT` and every subsequent step gates on it). MCP-strip transform anchors at start-of-line so it doesn't rewrite commented lines and trigger `cargo publish`'s dirty-tree check (9b59101 adds `--allow-dirty` as belt-and-suspenders for local-MCP testers who forget to re-comment).
+
+## [0.1.9] - 2026-05-16
+
+### Internal / CI
+
+- Restored crates.io auto-publish that was removed in PR #11. Fork crates publish under `_extended` renamed identifiers (no upstream conflict) with feature parity vs the registry; publish order is backend → macros → extended → md-viewer with a 45 s sparse-index settle delay between hops. "Already uploaded" treated as success → idempotent on re-tags.
+
 ## [0.1.8] - 2026-05-16
 
 ### Packaging
